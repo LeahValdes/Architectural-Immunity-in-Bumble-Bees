@@ -1,0 +1,1547 @@
+---
+title: "Outhouse_Project_Rmk"
+author: "Leah"
+date: "2024-03-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Initialize
+```{r Initialize}
+
+library(ggplot2)
+library(lme4)
+library(emmeans)
+library(ggpubr)
+library(tidyverse)
+library(car)
+library(DHARMa)
+library(dplyr)
+library(cowplot)
+library(glmmTMB)
+library(MASS)
+library(aod)
+library(ggeffects)
+library(readr)
+library(Rmisc);
+library(plyr); library(multcompView);
+library(ggeffects); library(mgcv); library(fitdistrplus);
+library(sjPlot);
+library(logistf)
+
+
+# Question 1: 
+#     Nest_modification.csv
+
+# Question 2, Comstock: 
+#     Micro_Liners.csv
+
+# Question 2, Greenhouse: 
+#     Greenhouse_Liners.csv
+#     Greenhouse_Final.csv
+
+# Question 3
+#     Colony_mechanism.csv
+#     Colony_mech_video.csv
+
+# Question 4: 
+#     Outhouse_weekly.csv: Weekly measurements of prevalence and infection load from screening n=15 workers from each colony 
+#     Outhouse_Weekly_Performance.csv: Weekly measurements up to week 6 of weight and reproduction for each colony
+#     Outhouse_Colonies.csv: Final measures of colony performance and initial colony metadata
+
+
+```
+
+## Question 1: Nest modification
+``` {r echo = FALSE}
+
+dat <- read.csv("Nest_modification.csv")
+ccPalette <- c("#DF8F44FF", "#3399FF")
+
+# filter out colonies infected with crithidia (made from source colonies)
+dat <- dat %>% filter(X != "crithidia")        
+# filter out replicate 1 
+    ## (intention was to test whether defecation patterns change before => after digging, but digging started so fast that it makes more sense to just focus on the end point)
+dat <- dat %>% filter(Rep == 2) %>%
+  filter(Colony != "E")                 # E didn't modify foam
+
+dat$Prop_green <- dat$Green_pixels/dat$Total_pixels
+dat$Log_prop_green <- log(dat$Prop_green)
+
+# change order of variables so they match other plots in paper
+dat$Location <- factor(dat$Location, levels = c("Nest","Foam"))
+
+# green pixels and prop green have tight linear relationship, because total area was approximately the same in every area, so we can use either variable 
+ggplot(data = dat, aes(x=Green_pixels, y=Prop_green)) + 
+  geom_point() +
+  scale_color_manual(values=ccPalette) +
+  cowplot::theme_cowplot()
+
+
+# simple stats: one-tailed two-sample t test
+#     alternate hypothesis: poop in nest is less than poop in foam 
+t.test(log(Prop_green)~Location, alternative = "less", data=dat)
+
+
+# a better option is to pair the observations and test whether they differ from 0 
+#     otherwise, we violate the assumption of independence 
+#     create dataframe w column of difference between areas
+#     these are the stats reported in the paper
+dat2 <- subset(dat, select = c(Colony, Location, Log_prop_green)) %>%
+  pivot_wider(names_from = Location, values_from = Log_prop_green)
+dat2$Log_poop_diff <- dat2$Foam - dat2$Nest
+
+t.test(dat2$Log_poop_diff, mu = 0, alternative = "greater")
+
+ggplot(data = dat2, aes(y=(Log_poop_diff))) + 
+  geom_boxplot() +
+  geom_point(aes(x=0)) +
+  cowplot::theme_cowplot() 
+
+
+
+```
+#### Figure2
+``` {r figure1}
+
+# figure 1
+figure1 <- ggplot(data = dat, aes(x=Location, y=log(Prop_green), color=Location)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width=0.07, height=0.1), alpha = 0.5) +
+  xlab(NULL) + ylab("Log. proportion area feces") +
+  scale_color_manual(values=ccPalette) + 
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none") 
+
+ggsave(figure1, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/Figure2.jpg", 
+       width=2.75, height=3.8)
+
+```
+
+## Question 2: Waste removal
+#### Comstock
+Experiments performed in Comstock growth chamber during Spring 2023 to assess defecation behavior (locations and quantities) when (1) infected with C. bombi versus (2) sham inoculum
+Bumble bee microcolonies (n=25 bees) had access to one main nest cavity and one additional "outhouse" cavity. The bees did not have access to a foraging cage. 
+Bees had ad lib access to sucrose feeder containing colored sucrose
+Area of nest and outhouse containing coloring was measured with ImageJ (Defecation)
+
+```{r Comstock}
+
+dat <- read.csv("Micro_Liners.csv")
+
+# create data frame with averages across replicates for each microcolony+infection+cavity
+dat_avg <- dat %>%
+  group_by(Micro, Treatment, Cavity, Replicate) %>%
+  summarize(Prop_Green = sum(Prop_Green)) %>%
+  summarize(mean(Prop_Green))         
+
+
+# converting all factor variables to factor
+dat$Source = as.factor(dat$Source)
+dat$Round = as.factor(dat$Round)
+dat$Micro = as.factor(dat$Micro)
+dat$Cavity = as.factor(dat$Cavity)
+dat$Treatment = as.factor(dat$Treatment)
+dat$Replicate = as.factor(dat$Replicate)
+
+
+#############################
+# NEST VS OUTHOUSE, Round 2 #
+#############################
+# Subtract Prop_Green between paired nest and outhouse.
+# This has two advantages. First, paired tests are always more powerful than
+# unpaired tests. Second, we avoid the issues of unequal variance and 
+# non-independence discussed earlier on.
+#
+# As an aside, we did not perform pairing for the outhouse-only or nest-only
+# models, because there doesn't seem to be any natural pairings. For example,
+# there is no particular reason why a healthy replicate 1 would be more closely
+# related to a Crithidia replicate 1 than a Crithidia replicate 2.
+
+
+# Create a "wide" data frame for the paired data.
+# There is probably a tidyverse package to do it, but I think it is easier to
+# just program a loop than to learn the syntax.
+# First, create a data frame where each row would correspond to a pair.
+dat_wide <- unique(dat[, c("Round", "Source", "Micro", "Treatment", "Replicate")])
+# Next, create empty columns to store Prop_Green in nest and in outhouse for
+# each pair.
+dat_wide$Prop_Green_Nest <- NA
+dat_wide$Prop_Green_Outhouse <- NA
+# Now populate the empty columns.
+for(i in 1:nrow(dat_wide)){
+  dat_wide[i, "Prop_Green_Nest"] <- 
+    subset(dat, Round==dat_wide[i,"Round",drop=T] &
+             Source==dat_wide[i,"Source",drop=T] &
+             Micro==dat_wide[i,"Micro",drop=T] &
+             Treatment==dat_wide[i,"Treatment",drop=T] &
+             Replicate==dat_wide[i,"Replicate",drop=T] &
+             Cavity=="Nest")$Prop_Green
+  
+  dat_wide[i, "Prop_Green_Outhouse"] <- 
+    subset(dat, Round==dat_wide[i,"Round",drop=T] &
+             Source==dat_wide[i,"Source",drop=T] &
+             Micro==dat_wide[i,"Micro",drop=T] &
+             Treatment==dat_wide[i,"Treatment",drop=T] &
+             Replicate==dat_wide[i,"Replicate",drop=T] &
+             Cavity=="Outhouse")$Prop_Green
+}
+
+# Calculate the difference between outhouse and nest.
+dat_wide$Prop_Green_Diff <- dat_wide$Prop_Green_Outhouse - dat_wide$Prop_Green_Nest
+
+# Now fit a model.
+lmer_diff <- lmer(Prop_Green_Diff ~ Treatment + (1|Round) + (1|Source), data=dat_wide)
+
+# If we want to determine whether there is more poop in the outhouse than nest,
+# we will have to test Prop_Green_Diff against 0 for each treatment.
+# We can use emmeans for this.
+diff_emm <- emmeans(lmer_diff, "Treatment")
+test(diff_emm)                
+# Both healthy and treatment have Prop_Green_Diff that are significantly larger
+# than 0!
+# multiply pvalues by 2 to account for multiple contrast tests (bonferroni method)
+
+# However, are they equally higher than zero?
+summary(lmer_diff)
+Anova(lmer_diff)
+# Nope, the fact that TreatmentHealthy is significantly positive means that
+# Prop_Green_Diff is lower for the Crithidia treatment. In other words, while
+# the Crithidia treatment still has more poop in the outhouse than the nest, the
+# difference is smaller than the healthy treatment.
+
+# Check model validity.
+library(DHARMa)
+plot(simulateResiduals(lmer_diff))
+ggqqplot(residuals(lmer_diff))                      
+plot(predict(lmer_diff), residuals(lmer_diff))
+
+
+```
+
+###### Figure Comstock
+```{r Comstock.Plots, echo=FALSE}
+
+dat <- read.csv("Micro_Liners.csv")
+
+# Create data frame with averages across replicates for each microcolony+infection+cavity
+dat_avg <- dat %>%
+  dplyr::group_by(Micro, Treatment, Cavity, Replicate) %>%
+  dplyr::summarize(Prop_Green = sum(Prop_Green)) %>%
+  dplyr::summarize(mean(Prop_Green))
+
+# Converting all factor variables to factor
+dat$Source = as.factor(dat$Source)
+dat$Round = as.factor(dat$Round)
+dat$Micro = as.factor(dat$Micro)
+dat$Cavity = as.factor(dat$Cavity)
+dat$Treatment = as.factor(dat$Treatment)
+dat$Replicate = as.factor(dat$Replicate)
+
+caPalette <- c("#3399FF", "#DF8F44FF", "black")
+
+
+# plots average proportion poop over three replicates for each microcolony
+p1 <- ggplot(dat_avg, aes(x=Cavity, color=Treatment, y=dat_avg$"mean(Prop_Green)")) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2, jitter.height=0), size=1.25, alpha=0.5) + 
+  scale_color_manual(values=caPalette) +
+  ylab("Prop. area feces") + xlab(NULL) +
+  ylim(0,1) + labs(tag="a)") +
+  cowplot::theme_cowplot() + 
+  theme(legend.position = c(.11,.83)) 
+
+
+p2 <- ggplot(data = dat_wide, aes(x=Prop_Green_Diff, fill=Treatment)) + 
+  geom_histogram(position="identity", alpha=0.5) + 
+  scale_fill_manual(values=caPalette) +
+  geom_vline(aes(xintercept=0), linetype="dashed") + 
+  xlab("Feces in outhouse - feces in nest") + ylab("Frequency") + labs(tag="(a)") +
+  theme_classic() + theme(legend.position = c(0.15,0.8))
+
+p3 <- ggarrange(p1,p2)
+
+ggsave(p2, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/S_Experiment1.jpg", 
+       width=6, height=5)
+
+
+```
+
+###  Greenhouse
+Experiments performed in Corson Mudd greenhouse during Fall 2023 to assess defecation and corpse removal behavior (locations and quantities) when (1) infected with C. bombi versus (2) sham inoculum
+Bumblebee microcolonies (n=25 bees) had access to one main nest cavity, additional "outhouse cavity," and foraging cage
+In 50% of colonies, all bees were inoculated with C. bombi (1000cells/uL); 50% of colonies were inoculated with sham control
+Bees had ad lib access to sucrose feeder containing red-colored sucrose
+Area of nest, outhouse, and feeder containing red coloring was measured with ImageJ (Defecation)
+Colony performance and mortality were also measured at termination
+
+####   Defecation
+```{r Greenhouse.Defecation}
+
+## Defecation: Where do bumble bees defecate? Does this change with C. bombi infection? 
+
+dat <- read.csv("Greenhouse_Liners.csv")
+# omitting microcolony D5 because it was crazy 
+## it started building honeypots and laying eggs on the feeder (outside nest)
+## we think this is a biologically relevant reason to omit it
+dat <- subset(dat, Micro!="D5")
+
+dat$Block = as.factor(dat$Block)
+dat$Source = as.factor(dat$Source)
+dat$Area = as.factor(dat$Area)
+dat$Treatment = as.factor(dat$Treatment)
+
+# Linear mixed model 
+# Response variable: The total number of red pixels (proxy for feces) on the respective liner
+#     This is a measure of total defecation in the area
+#     - Fixed effect: Crithidia treatment (Crithidia vs control), location (nest, outhouse, feeder), their interaction
+#     - Random effects: Source colony and block the microcolony was part of
+#     - Log transforming the data so that we can use normal distribution and lmm
+#     including sucrose consumption and mortality as fixed effects to account for whether the effect is driven by mortality / sucrose consumption. they are highly correlated but that's ok, we aren't really interested in their effects; using them to account for variation
+
+lmer_greenhouse <- lmer(log(Red_Pixels) ~ Treatment*Area + Sucrose_Consumption +
+                          (1|Source) + (1|Block), 
+                        data=dat)
+
+summary(lmer_greenhouse)
+Anova(lmer_greenhouse)
+
+# Assumptions look good after log transformation 
+plot(simulateResiduals(lmer_greenhouse))
+
+# Model for contrast tests:
+# There was no interaction, so I removed the interaction according to principle of marginality
+lmer_greenhouse2 <- lmer(log(Red_Pixels) ~ Treatment + Area + Sucrose_Consumption + 
+                           (1|Source) + (1|Block), 
+                         data=dat)
+# Assumptions look good with log transformation
+plot(simulateResiduals(lmer_greenhouse2))
+
+# All cavities have different amounts of poop overall
+# Tukey adjustment for comparing a family of 3 estimates
+emm <- emmeans(lmer_greenhouse2, "Area")
+pairs(emm) 
+
+
+```
+
+#### Mortality
+```{r Greenhouse.Mortality}
+
+## Corpse Removal: Where are bumblebee corpses located (in nest, outhouse, or foraging cage)? Does this change with Crithidia bombi infection?  
+
+dat <- read.csv("Greenhouse_Final.csv")
+dat$Set <- as.factor(dat$Set)
+dat$Date = as.factor(dat$Date)
+dat$Set = as.factor(dat$Set)
+dat$Source = as.factor(dat$Source)
+dat$Treatment = as.factor(dat$Treatment)
+
+#   Omitting microcolony D5 because it started building honeypots and laying eggs in the foraging cage
+dat <- subset(dat, Micro!="D5")
+#   Add column for mortality: # bees at start of experiment - # alive at the end of experiment
+dat$Mortality <- 25 - dat$Alive_Nest
+
+# Stack dead nest, dead outhouse, and dead outside. We will use this df for analysis
+dat1 <- cbind(dat[c(1:5,21)], stack(dat[c(7:9)]))
+dat1$ind <- factor(dat1$ind, levels = c("Dead_Outside", "Dead_Nest", "Dead_Outhouse"), ordered=TRUE)
+
+#   Generalized Linear Mixed Model
+
+#       Response variable: Number of dead bees 
+#       Fixed effects: Location (ind; nest, outhouse, or outside) * Treatment (+Crithidia, control)
+#       Random effects: Source Biobest colony, Block during which experiments were performed (Set)
+#       Distribution: Poisson
+glmm_dead <- glmmTMB(values ~ ind*Treatment + (1|Source) + (1|Set), 
+                     data = dat1, family=poisson(link=log))
+Anova(glmm_dead)
+plot(simulateResiduals(glmm_dead))
+
+# There was no interaction, so I removed the interaction according to principle of marginality (and for consistency with feces analysis methods)
+glmm_dead2 <- glmmTMB(values ~ ind + Treatment + (1|Source) + (1|Set), 
+                     data = dat1, family=poisson(link=log))
+
+
+# Report contrast tests for the model WITH the interaction 
+# From Wee Hao: If you don't include the interactions, then it is equivalent to assuming that the treatment effect is the same regardless of location, so not surprisingly the contrasts will be identical.
+emm <- emmeans(glmm_dead2, "ind")
+pairs(emm)
+
+
+```
+
+###### Figure3
+```{r Greenhouse.Defecation.Plot}
+
+### Figures showing the distribution of feces and corpses in the bumble bee nest, outhouse, and feeder areas 
+
+dat <- read.csv("Greenhouse_Liners.csv")
+# Omitting microcolony D5 because it was crazy and started laying eggs and building in foraging cage
+dat <- subset(dat, Micro!="D5")       # D5 is a control colony
+                                      # so this means n=18 for inoculated and n=18 for control
+                                      # because one crithidia colony is also missing (died)
+
+caPalette <- c("#1A85FF", "#DF8F44FF", "black")
+
+## Figure: Log scale
+Fig1c <- ggplot(data = dat, aes(x=Area, y=log(Red_Pixels/Total_Pixels), color=Treatment)) + 
+  geom_boxplot(outlier.shape = NA) + geom_point(position = position_jitterdodge(jitter.width = .2), size=1.25, alpha=0.5) +
+  ylab("Log prop. area feces") + labs(tag="(b)") +
+  scale_color_manual(values=caPalette) + 
+  cowplot::theme_cowplot() + 
+  theme(axis.title.x = element_blank(), legend.position = c(0.1,0.8))
+
+
+
+###### Corpses
+
+dat <- read.csv("Greenhouse_Final.csv")
+dat$Set <- as.factor(dat$Set)
+# omitting microcolony D5 because it was crazy 
+## it started building honeypots and laying eggs on the feeder (outside nest)
+dat <- subset(dat, Micro!="D5")
+dat$Mortality <- 25 - dat$Alive_Nest
+dat$Date = as.factor(dat$Date)
+dat$Set = as.factor(dat$Set)
+dat$Source = as.factor(dat$Source)
+dat$Treatment = as.factor(dat$Treatment)
+
+dat1 <- cbind(dat[c(1:5,21)], stack(dat[c(7:9)]))
+dat1$ind <- factor(dat1$ind, levels = c("Dead_Outside", "Dead_Nest", "Dead_Outhouse"), ordered=TRUE)
+
+p.mort <- ggplot(data = dat1, aes(x=ind, y=values, color=Treatment)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitterdodge(jitter.height = 0.1, jitter.width = 0.3), size=1.25, alpha=0.5) + 
+  ylab("No. corpses") + xlab(NULL) + labs(tag="(c)") +
+  scale_color_manual(values = caPalette) +
+  scale_x_discrete(labels=c("Foraging\narena", "Nest", "Outhouse")) +
+  cowplot::theme_cowplot() + 
+  theme(legend.position = "none")
+
+fig2 <- ggarrange(Fig1c,p.mort,nrow=2, ncol=1)
+figure3 <- ggarrange(p2,fig2)
+
+ggsave(figure3, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/Figure3.jpg", 
+       width=9, height=6)
+
+ggsave(figure3, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/Figure3.pdf", 
+       width=9, height=6)
+
+```
+
+
+
+## Question 3: Social immunity
+#### Infection
+```{r mechanism}
+
+
+dat <- read.csv("Colony_mechanism.csv")
+dat <- dat %>% filter(Location != "") %>%
+  mutate(prevalence = ifelse(Crithidia >0,1,0)) %>%
+  group_by(Colony, Inoculum, Location) %>%
+  dplyr::summarise(Crithidia = mean(Crithidia), 
+                   Prevalence = sum(prevalence)) %>%
+  mutate(binary = ifelse(Prevalence > 0,1,0))
+
+  
+observed <- c(1,0,8,0)                  # observed values: these are numbers of colonies with infected bees (corpse+nest, corpse+out, feces+nest, feces+nest)
+expected <- c(2.25,2.25,2.25,2.25)      # expected values given same number of positives, equally distributed across groups
+chisq.test(observed, p = expected, rescale.p = TRUE)
+
+# Create contingency table.
+positive <- observed 
+negative <- 8 - observed      # 8 because n=8
+treatment <- c("corpse_nest", "corpse_out", "feces_nest", "feces_out")
+
+# Are there differences between all four treatments?
+fisher.test(cbind(positive, negative))
+
+
+# Using Fisher's exact test and then Bonferroni for pairwise comparisons 
+fisher.test(cbind(positive,negative)[c(1,3),])  # First and third rows are corpse_nest and feces_nest.
+fisher.test(cbind(positive,negative)[c(3,4),])  # Third and fourth rows are feces_nest and feces_out.
+fisher.test(cbind(positive,negative)[c(1,2),])  # First and second rows are corpse_nest and corpse_out.
+
+
+  
+```
+#### Behavior 
+
+```{r behavior}
+
+dat1 <- read.csv("Colony_mech_video.csv")
+dat1 <- dat1 %>% filter(Inoculum == "Feces")
+dat1$Location <- as.factor(dat1$Location)
+
+
+# because we have count data, normal distribution is not ideal and poisson or nbinom would be preferred 
+# poisson seems to fit the best 
+model <- glmer(Contacts ~ Location + (1|Colony), data = dat1, family = poisson(link = "log")) 
+summary(model)
+Anova(model)
+
+e <- emmeans(model, pairwise ~ Location) 
+plot(e)
+
+# check assumptions 
+ggqqplot(residuals(model))                      
+plot(predict(model), residuals(model))
+
+```
+
+###### Figure4
+
+```{r figure}
+
+ccPalette <- c("#DF8F44FF", "#3399FF")
+cdPalette <- c("#DF8F44FF", "#80471C", "#3399FF")
+
+
+# Intensity (mean crithidia per colony)
+a <- ggplot(data = dat, aes(x=Inoculum, y=Crithidia, color=Location)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.1, jitter.height = 1), size = 2.3, alpha = 0.65) + 
+  ylab("Infection intensity (cell count / 500 nL)") + labs(tag="(a)") +
+  scale_color_manual(values=ccPalette) +
+  cowplot::theme_cowplot() + 
+  theme(legend.position = c(0.12,0.8))
+
+b <- ggplot(data = dat1, aes(x=Location, y=log(Contacts+1), color=Location)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width=0.05), alpha = 0.5, size = 2.3) + 
+  ylab("Log. no. contacts with feces") + labs(tag = "(b)") +
+  scale_color_manual(values = cdPalette) +
+  cowplot::theme_cowplot() + 
+  theme(axis.title.x = element_blank(), legend.position = "none")
+
+ggplot(data = dat1, aes(x=Location, y=(Contacts), color=Location)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width=0.05), alpha = 0.5) + 
+  ylab("Log. no. contacts with feces") +
+  scale_color_manual(values = cdPalette) +
+  cowplot::theme_cowplot() + 
+  theme(axis.title.x = element_blank(), legend.position = c(0.65, 0.8))
+
+fig4 <- ggarrange(a,b,nrow=1,ncol=2)
+
+
+ggsave(fig4, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/Figure4.pdf", width=8, height=5)
+
+
+ggsave(fig4, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/Figure4.jpg", 
+       width=8, height=5)
+
+```
+## Question 4: Outhouse
+#### Prevalence
+```{r echo=FALSE}
+  
+############################################################################
+# COMPARISON OF PREVALENCE BETWEEN COLONIES WITH AND WITHOUT AND OUTHOUSE ##
+############################################################################
+
+prev <- read.csv("Outhouse_weekly.csv") 
+
+# turn characters into factors
+prev %>% mutate_if(is.character, as.factor) -> prev
+prev$Week.factor <- as.factor(prev$Week) 
+prev$Inoc_treatment <- as.factor(prev$Inoc_treatment)
+
+# we want to recode week 1 as week 0 so the intercepts make sense 
+prev$Week0 <- prev$Week - 1
+
+# add column for prevalence: binary for crithidia presence/absence
+prev <- prev %>% mutate(prevalence = ifelse(No_crithidia > 0,1,0))
+
+
+############################
+## PREVALENCE OF INFECTION ##
+############################
+
+### MODELS, logistic regression
+
+#  useful resource: https://mcfromnz.wordpress.com/2011/03/02/anova-type-iiiiii-ss-explained/
+# full model with 3-way interaction, bee size and colony as random effect
+
+# original model with 3-way interaction
+# binomial distribution because prevalence data is presence/absence (binary)
+# first week of data collection (week 1) is coded as week 0 here, so that estimate isn't extrapolating back to before first data collection
+model4 <- glmmTMB(prevalence~  Cavity_treatment*Inoc_treatment*Week0+ Marginal_cell + (1|Colony), 
+              family = "binomial",  data = prev)
+Anova(model4)
+
+# ** as discussed with wee hao - we don't actually have to do this because the Anova() function uses type II tests - results are from model4
+model2<- glmmTMB(prevalence~Cavity_treatment*Week0 + Inoc_treatment*Week0 + Cavity_treatment*Inoc_treatment+ Marginal_cell + (1|Colony), 
+              family = "binomial",  data = prev)
+
+
+# one where week starts at 1 so the figure x axis isn't confusing
+model1<- glmmTMB(prevalence~Cavity_treatment*Week*Inoc_treatment + Cavity_treatment*Inoc_treatment+ Marginal_cell + (1|Colony), 
+              family = "binomial",  data = prev)
+
+# test assumptions
+res <- simulateResiduals(model2)
+plot(res)     #normality and homoskedacity 
+res <- simulateResiduals(model3)
+plot(res)     #normality and homoskedacity 
+res <- simulateResiduals(model4)
+plot(res)     #normality and homoskedacity 
+
+# test for temporal autocorrelation since we're using week as a continuous predictor
+#    not a huge problem (p=0.094) 
+# reference: https://search.r-project.org/CRAN/refmans/DHARMa/html/testTemporalAutocorrelation.html
+res1 <- recalculateResiduals(res, group = prev$Week0)           # aggregating residuals by time 
+testTemporalAutocorrelation(res1, time = unique(prev$Week0))
+
+# multiple comparisons. use model with 3-way interaction. 
+emmeans(model4, pairwise ~ Cavity_treatment|Inoc_treatment)
+emmeans(model4, pairwise ~ Inoc_treatment|Cavity_treatment)
+
+
+```
+
+#### Intensity
+```{r Outhouse_Intensity}
+
+############################
+## INTENSITY OF INFECTION ##
+############################
+
+# Create an object with ONLY the data of infected bees
+inten <- subset(prev, No_crithidia >0) 
+inten$Inoc_treatment <- as.factor(inten$Inoc_treatment)
+
+# i would prefer to only analyze infection intensity at the end of the experiment (week 6) due to small sample sizes in earlier weeks
+
+# subsetting week 6 infection intensity data
+inten6 <- subset(inten, Week == 6)
+
+# model for week 6 intensity
+# truncated negative binomial distribution because we aren't including 0s 
+# reporting results from this model
+modin6 <- glmmTMB(No_crithidia ~ Cavity_treatment*Inoc_treatment + Marginal_cell + (1|Colony), family = truncated_nbinom1(link = "log"), data=inten6)
+
+# assumptions look good
+plot(simulateResiduals(modin6))
+plot(simulateResiduals(modin7))
+
+# results - type II wald 
+Anova(modin6)
+
+# contrast tests for intensity differences in outhouse vs. control within each inoculation treatment
+# it doesn't really make sense to include these, because the interaction was not significant
+emm <- (emmeans(modin6, pairwise ~ Cavity_treatment | Inoc_treatment))
+plot(emm)
+
+
+```
+
+
+
+###### Figure5
+```{r Outhouse_Figs, echo=FALSE}
+
+prev <- read.csv("Outhouse_weekly.csv") 
+#prev <- subset(prev, Week > 1)          # don't include  data from the first week
+
+# turn characters into factors
+prev %>% mutate_if(is.character, as.factor) -> prev
+prev$Week.factor <- as.factor(prev$Week) 
+prev$Inoc_treatment <- as.factor(prev$Inoc_treatment)
+prev$Week0 <- prev$Week - 1
+
+# add column for prevalence: binary for crithidia presence/absence
+prev <- prev %>% mutate(prevalence = ifelse(No_crithidia > 0,1,0))
+
+caPalette <- c("#DF8F44FA","#3399FF", "black")
+facet.labs <- c("3" = "3% Inoculated", "30" = "30% Inoculated")
+
+
+####################################################################
+# C. bombi PREVALENCE
+####################################################################
+#     figure with the predictions of the models
+# "Week" has to be as.numerical for the figure to be as lines
+a <- ggpredict(model1, c("Week", "Cavity_treatment", "Inoc_treatment"), back.transform = TRUE)
+plot(a) + labs( x = "Week", y = "Probability of infection (%)") + 
+  labs(colour = "Initial prevalence") 
+
+prev$Inoc_treatment <- as.character(prev$Inoc_treatment)
+
+# figure with predictions of model and raw data points
+p.prev <- predict(model2, type="response", interval="confidence", re.form=NA)
+
+# Plot of prevalence data for 3% inoculation group
+p3_prev <- ggplot(data=subset(a, facet=="3"), aes(x=x, y=predicted, color=group)) + 
+  geom_point(data=subset(prev, Inoc_treatment=="3"), aes(x=Week, y=prevalence,color=Cavity_treatment), size = .5, position = position_jitterdodge(jitter.width = .5, jitter.height = .1), alpha=0.9) +
+  geom_line(linewidth=.75) +
+  geom_ribbon(aes(ymin=conf.low, ymax=conf.high, fill=group), alpha=.15, linetype=0) +
+  scale_color_manual(values=caPalette) + scale_fill_manual(values=caPalette) +
+  xlab("Weeks")+ylab("Probability of C. bombi infection (%)") + 
+  labs(title="Low intitial inoculation (3%)", fill="Cavity Treatment", color="Cavity Treatment", tag="A") +
+  theme_bw() +
+  theme(legend.position="top", plot.title = element_text(hjust = 0.5)) 
+
+# Plot of prevalence data for 30% inoculation group
+p30_prev <- ggplot(data=subset(a, facet=="30"), aes(x=x, y=predicted, color=group)) + 
+  geom_point(data=subset(prev, Inoc_treatment=="30"), aes(x=Week, y=prevalence,color=Cavity_treatment), size = .5, position = position_jitterdodge(jitter.width = .5, jitter.height = .1), alpha=0.9) +
+  geom_line(linewidth=.75) +
+  geom_ribbon(aes(ymin=conf.low, ymax=conf.high, fill=group), alpha=.15, linetype=0) +
+  scale_color_manual(values=caPalette) + scale_fill_manual(values=caPalette) +
+  xlab("Weeks")+ylab("Probability of C. bombi infection (%)") + 
+  labs(title="High initial inoculation (30%)", fill="Cavity Treatment", color="Cavity Treatment", tag="B") +
+  theme_bw() + 
+  theme(legend.position="top", plot.title = element_text(hjust = 0.5)) 
+ 
+###########################################
+######## Aspergillus prevalence figure
+###########################################
+
+dat <- read.csv("Aspergillus.csv")
+dat <- dat %>% 
+  filter(Inoc_treatment!="") %>%
+  filter(Colony_ID != "K") %>%            # omitting K, T because we didn't take data from them :(
+  filter(Colony_ID != "T")
+
+dat$total_individuals <- dat$Final_workers_n + dat$Final_gynes_n + dat$Final_males_n + dat$Final_pupae_n + dat$Final_larvae_n + dat$Final_males_n
+dat$percap_asp <- dat$Aspergillus / dat$total_individuals
+
+dat_inf <- filter(dat, Aspergillus > 0)
+
+# figure showing aspergillus prevalence per colony by cavity treatment, including all colonies
+asp <- ggplot(data = dat, aes(x=Cavity_treatment, y = percap_asp)) +
+  geom_boxplot(alpha=0.5, outlier.color = NA) +
+  geom_point(position = position_jitter(width=0.1), alpha = 0.5, size = 2.75) + 
+  ylab("A. flavus prevalence") + xlab(NULL)+ labs(tag="C") +
+  cowplot::theme_cowplot()
+
+x <- ggarrange(p3_prev,p30_prev,asp,ncol=3)
+
+ggsave(x, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/Figure5.pdf", 
+      width=10, height=5)
+
+ggsave(x, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/Figure5.jpg", 
+      width=10, height=5)
+
+
+
+```
+
+###### Figure S6
+Shows final week 6 prevalence and intensity measurements for each colony
+```{r inten6_fig, echo=FALSE}
+
+
+prev <- read.csv("Outhouse_weekly.csv") 
+caPalette <- c("#DF8F44FA","#3399FF", "black")
+
+############################
+###   INTENSITY 
+############################
+
+prev <- read.csv("Outhouse_weekly.csv") 
+
+# turn characters into factors
+prev %>% mutate_if(is.character, as.factor) -> prev
+prev$Week.factor <- as.factor(prev$Week) 
+prev$Inoc_treatment <- as.factor(prev$Inoc_treatment)
+inten <- subset(prev, No_crithidia >0) 
+inten$Inoc_treatment <- as.factor(inten$Inoc_treatment)
+
+# Intensity figure
+# Plot of intensity data for 3% inoculation group
+p3_inten <- ggplot(data = subset(inten, Inoc_treatment=="3"), aes(x=Week, y=No_crithidia,color=Cavity_treatment)) + 
+  geom_point(size = .5, position = position_jitterdodge(jitter.width = .45, jitter.height = .05), alpha=0.9) + 
+  scale_color_manual(values=caPalette) + scale_fill_manual(values=caPalette) +
+  xlab("Weeks")+ylab("Infection intensity (cell count / 500 nL)") + 
+  ylim(0,210) +
+  labs(title="Low intial inoculation (3%)", fill="Cavity Treatment", color="Cavity Treatment", tag="A") +
+  theme_bw() +
+   theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+
+# Plot of intensity data for 30% inoculation group 
+p30_inten <- ggplot(data = subset(inten, Inoc_treatment=="30"), aes(x=Week, y=No_crithidia,color=Cavity_treatment)) + 
+  geom_point(size = .5, position = position_jitterdodge(jitter.width = .45, jitter.height = .05), 
+             alpha=0.9) + 
+  scale_color_manual(values=caPalette) + scale_fill_manual(values=caPalette) +
+  xlab("Weeks")+ylab("Infection intensity (cell count / 500 nL)") + 
+  ylim(0,210) +
+  labs(title="High initial inoculation (30%)", fill="Cavity Treatment", color="Cavity Treatment", tag="B") +
+  theme_bw() +
+   theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+
+
+############################
+###   INTENSITY: WEEK 6
+############################
+
+inten <- subset(inten, Week == 6)
+inten6 <- inten %>% group_by(Colony, Inoc_treatment,Cavity_treatment) %>%
+  dplyr::summarise(No_crithidia = mean(No_crithidia))
+
+i5 <- ggplot(inten6, aes(x=(Inoc_treatment), y=log(No_crithidia), color=Cavity_treatment)) + 
+  geom_boxplot(data=inten, aes(x=Inoc_treatment, y=log(No_crithidia),color=Cavity_treatment),outlier.shape = NA) + 
+  geom_point(data=inten, aes(x=Inoc_treatment,y=log(No_crithidia),color=Cavity_treatment),
+             position = position_jitterdodge(jitter.width = 0.5, jitter.height = 0.025), size=0.5, alpha=0.75) +
+  geom_label(aes(label=Colony), label.size=0.15, position = position_jitterdodge(jitter.width = .01, jitter.height = .01)) + 
+  xlab("Inoculation treatment") + ylab("Log infection intensity (cell count / 500 nL)") +
+  labs(color="Cavity Treatment", tag="C", title = "Infection intensity (week 6)") +
+  scale_color_manual(values=caPalette) + 
+  theme_bw() + 
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+
+
+i5 <- ggplot(inten6, aes(x=(Inoc_treatment), y=log(No_crithidia), color=Cavity_treatment)) + 
+  geom_boxplot(data=inten, aes(x=Inoc_treatment, y=log(No_crithidia),color=Cavity_treatment),outlier.shape = NA) + 
+  geom_point(data=inten, aes(x=Inoc_treatment,y=log(No_crithidia),color=Cavity_treatment),
+             position = position_jitterdodge(jitter.width = 0.5, jitter.height = 0.025), size=0.5, alpha=0.75) + 
+  geom_point(size=3, position = position_jitterdodge(jitter.width = 0, jitter.height = 0.025)) +
+  xlab("Inoculation treatment") + ylab("Log infection intensity (cell count / 500 nL)") +
+  labs(color="Cavity Treatment", tag="C", title = "Infection intensity (week 6)") +
+  scale_color_manual(values=caPalette) + 
+  theme_bw() + 
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+
+ggarrange(p3_inten,p30_inten)
+
+figS5 <- ggarrange(p3_inten,p30_inten,i5,ncol=3)
+
+ggsave(figS5, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/S_Intensity.pdf", 
+       width=10, height=5)
+
+```
+
+
+
+
+#### Growth
+```{r}
+################################################
+# Weekly nest weight
+################################################
+
+dat <- read.csv("Outhouse_Weekly_Performance.csv")
+dat$Week.factor <- as.factor(dat$Week) 
+
+# Filter out empty rows 
+dat <- filter(dat, Cavity_treatment == "Control" | Cavity_treatment == "Outhouse")
+names(dat)[1] <- "Colony"
+dat$Inoc_treatment <- as.factor(dat$Inoc_treatment)
+dat$Total_dead <- dat$Dead_nest + dat$Dead_outh
+
+
+### Wee Hao additions ###
+# Because Anova() is not smart enough to recognise that I(Week^2) is higher order than Week,
+# we need to do a lot of refitting by hand when performing Type II tests.
+
+# We start with the full, most general model with 3-way interactions and quadratic dependence.
+
+# Test only for Cavity:Inoc:I(Week^2).
+# Not significant.
+model <- lmer(Weight ~ Cavity_treatment* (Week + I(Week^2)) * Inoc_treatment + (1|Colony),  data = dat)
+Anova(model)
+
+
+# Test only for Cavity:Inoc:Week, Cavity:I(Week^2) and Inoc:I(Week^2), by dropping Cavity:Inoc:I(Week^2) from model.
+# Not significant.
+model1 <- lmer(Weight ~ Cavity_treatment*Week*Inoc_treatment +
+                  + Cavity_treatment*I(Week^2) +
+                  I(Week^2)*Inoc_treatment + (1|Colony),  data = dat)
+Anova(model1)
+
+
+# Test only for Cavity:Inoc, by dropping Cavity:Inoc:Week from model1.
+# Not significant.
+model2a <- lmer(Weight ~ Cavity_treatment*Inoc_treatment + Cavity_treatment*(Week + I(Week^2)) +
+                 (Week + I(Week^2))*Inoc_treatment + (1|Colony),  data = dat)
+Anova(model2a)
+
+# Test only for Cavity:Week, by dropping Cavity:Inoc:Week and Cavity:I(Week^2) from model1.
+# Significant, chisq = 36.2742, p < 0.001.
+model2b <- lmer(Weight ~ Cavity_treatment*Inoc_treatment + Cavity_treatment*Week +
+                  (Week + I(Week^2))*Inoc_treatment + (1|Colony),  data = dat)
+Anova(model2b)
+
+# Test only for Inoc:Week, by dropping Cavity:Inoc:Week and Inoc:I(Week^2) from model1.
+# Not significant.
+model2c <- lmer(Weight ~ Cavity_treatment*Inoc_treatment + Week*Inoc_treatment +
+                  Cavity_treatment*(Week + I(Week^2)) + (1|Colony),  data = dat)
+Anova(model2c)
+
+# Test only for I(Week^2), by dropping Cavity:I(Week^2) and Inoc:I(Week^2) from model1.
+# Not significant.
+model2d <- lmer(Weight ~ Cavity_treatment*Inoc_treatment*Week + Week*Inoc_treatment +
+                  Cavity_treatment*Week + I(Week^2) + (1|Colony),  data = dat)
+Anova(model2d)
+
+
+# Test only for Cavity, by dropping Cavity:Inoc, Cavity:Week and Cavity:I(Week^2) from model2a.
+# Significant, chisq = 25.2463, p < 0.001.
+model3a <- lmer(Weight ~ Cavity_treatment + (Week + I(Week^2))*Inoc_treatment +
+                  (1|Colony),  data = dat)
+Anova(model3a)
+
+# Test only for Inoc, by dropping Cavity:Inoc, Inoc:Week and Inoc:I(Week^2) from model2a.
+# Not significant, chisq = 0.4177, p = 0.5181.
+model3b <- lmer(Weight ~ Cavity_treatment * (Week + I(Week^2)) + Inoc_treatment +
+                  (1|Colony),  data = dat)
+Anova(model3b)
+
+# Test for Week, by dropping almost everything from model except the main effects and Cavity:Inoc.
+# Significant.
+model3c <- lmer(Weight ~ Cavity_treatment*Inoc_treatment + Week + (1|Colony),  data = dat)
+Anova(model3c)
+
+##### OUTPUT: 
+# Cavity_treatment                               25.2463  1  5.046e-07 ***
+#  Week                                          133.3349  1  < 2.2e-16 ***
+#  I(Week^2)                                     302.3965  1  < 2.2e-16 ***
+#  Inoc_treatment                                0.4177  1     0.5181    
+# Cavity_treatment:Week                          36.2742  1  1.714e-09 
+# Cavity_treatment:I(Week^2)                     0.4023  1    0.52591    
+# Cavity_treatment:Inoc_treatment                0.5483  1    0.45900    
+# Inoc_treatment:Week                            0.6916  1    0.40561    
+# Inoc_treatment:I(Week^2)                       0.7917  1    0.37359    
+# Cavity_treatment:Week:Inoc_treatment           0.7084  1    0.39999    
+# Cavity_treatment:I(Week^2):Inoc_treatment      0.0109  1    0.91686    
+
+
+# Test residuals. 
+plot(simulateResiduals(model))
+ggqqplot(residuals(model))                # test normality of residuals
+plot(predict(model), residuals(model))    # test homogeneity of residuals
+
+plot(simulateResiduals(model1))
+ggqqplot(residuals(model1))
+plot(predict(model1), residuals(model1))
+
+plot(simulateResiduals(model2a))
+ggqqplot(residuals(model2a))
+plot(predict(model2a), residuals(model2a))
+
+plot(simulateResiduals(model2b))
+ggqqplot(residuals(model2b))
+plot(predict(model2b), residuals(model2b))
+
+plot(simulateResiduals(model2c))
+ggqqplot(residuals(model2c))
+plot(predict(model2c), residuals(model2c))
+
+plot(simulateResiduals(model2d))
+ggqqplot(residuals(model2d))
+plot(predict(model2d), residuals(model2d))
+
+plot(simulateResiduals(model3a))
+ggqqplot(residuals(model3a))
+plot(predict(model3a), residuals(model3a))
+
+plot(simulateResiduals(model3b))
+ggqqplot(residuals(model3b))
+plot(predict(model3b), residuals(model3b))
+
+plot(simulateResiduals(model3c))
+ggqqplot(residuals(model3c))
+plot(predict(model3c), residuals(model3c))
+
+
+# test for temporal autocorrelation since we're using week as a continuous predictor
+# reference: https://search.r-project.org/CRAN/refmans/DHARMa/html/testTemporalAutocorrelation.html
+res <- recalculateResiduals(simulateResiduals(model), group = dat$Week)           # aggregating residuals by time 
+testTemporalAutocorrelation(res, time = unique(dat$Week))
+
+res1 <- recalculateResiduals(simulateResiduals(model1), group = dat$Week)           # aggregating residuals by time 
+testTemporalAutocorrelation(res1, time = unique(dat$Week))
+
+res2a <- recalculateResiduals(simulateResiduals(model2a), group = dat$Week)           # aggregating residuals by time 
+testTemporalAutocorrelation(res2a, time = unique(dat$Week))
+
+res2b <- recalculateResiduals(simulateResiduals(model2b), group = dat$Week)           # aggregating residuals by time 
+testTemporalAutocorrelation(res2b, time = unique(dat$Week))
+
+res2c <- recalculateResiduals(simulateResiduals(model2c), group = dat$Week)           # aggregating residuals by time 
+testTemporalAutocorrelation(res2c, time = unique(dat$Week))
+
+res2d <- recalculateResiduals(simulateResiduals(model2d), group = dat$Week)           # aggregating residuals by time 
+testTemporalAutocorrelation(res2d, time = unique(dat$Week))
+
+res3a <- recalculateResiduals(simulateResiduals(model3a), group = dat$Week)           # aggregating residuals by time 
+testTemporalAutocorrelation(res3a, time = unique(dat$Week))
+
+res3b <- recalculateResiduals(simulateResiduals(model3b), group = dat$Week)           # aggregating residuals by time 
+testTemporalAutocorrelation(res3b, time = unique(dat$Week))
+
+res3c <- recalculateResiduals(simulateResiduals(model3c), group = dat$Week)           # aggregating residuals by time 
+testTemporalAutocorrelation(res3c, time = unique(dat$Week))
+
+```
+
+
+
+
+
+#### Reproduction
+```{r }
+ccPalette <- c("#DF8F44FF", "#3399FF")
+
+# fixed effects: outhouse treatment, inoculation treatment, interaction (but no interactions are significant, so removed)
+# random effects: ? probably none since each colony has one measurement  
+
+##  Reproduction number (larvae, pupae, males, gynes)
+# Final colony reproduction figures
+
+dat1 <- read.csv("Outhouse_Colonies.csv") 
+dat1$Trt <- paste(dat1$Inoc_treatment, dat1$Cavity_treatment)
+
+dat1$Total_individuals_n <- dat1$Final_gynes_n + dat1$Final_males_n + dat1$Final_pupae_n + dat1$Final_workers_n
+dat1$Rep_n <- dat1$Final_gynes_n + dat1$Final_males_n 
+
+####################################
+# models testing whether each measure of reproduction differs with cavity treatment * inoculation treatment
+
+# all individuals
+all <- glmmTMB(Total_individuals_n ~ Cavity_treatment * Inoc_treatment, data = dat1, family=nbinom1())
+plot(simulateResiduals(all))
+Anova(all)
+
+# reproductives_n
+reproductives <- glmmTMB(Rep_n ~ Cavity_treatment * Inoc_treatment, data = dat1, family=nbinom1())
+plot(simulateResiduals(reproductives))
+Anova(reproductives)
+
+# gynes_n
+gynes1 <- glmmTMB(Final_gynes_n ~ Cavity_treatment * Inoc_treatment, data = dat1, family=nbinom1())
+plot(simulateResiduals(gynes1))
+Anova(gynes1)
+
+# males_n 
+males1 <- glmmTMB(Final_males_n ~ Cavity_treatment * Inoc_treatment, data = dat1, family=nbinom1())
+plot(simulateResiduals(males1))
+Anova(males1)
+
+# workers_n
+workers1 <- glmmTMB(Final_workers_n ~ Cavity_treatment * Inoc_treatment, data = dat1, family=nbinom1())
+plot(simulateResiduals(workers1))
+Anova(workers1)
+
+# pupae
+pupae <- glmmTMB(Final_pupae_n ~ Cavity_treatment * Inoc_treatment, data = dat1, family=nbinom1())
+plot(simulateResiduals(pupae))
+Anova(pupae)
+```
+
+###### Figure 6
+```{r }
+#################################################
+# Weekly colony growth measures
+
+dat <- read.csv("Outhouse_Weekly_Performance.csv")
+
+# Filter out empty rows 
+dat <- filter(dat, Cavity_treatment == "Control" | Cavity_treatment == "Outhouse")
+dat$Inoc_treatment <- as.factor(dat$Inoc_treatment)
+dat$Total_dead <- dat$Dead_nest + dat$Dead_outh
+dat$Trt <- paste(dat$Inoc_treatment, dat$Cavity_treatment)
+
+cbPalette <- c("#DF8F44FF", "#3399FF")
+
+facet.labs <- c("3%" = "3% Inoculated", "30%" = "30% Inoculated")
+
+b <- ggpredict(model2b, c("Week [all]", "Cavity_treatment", "Inoc_treatment"), back.transform = TRUE)
+plot(b) + labs( x = "Week", y = "Weight (g)") + 
+  labs(colour = "Initial prevalence") 
+
+# plot of weekly weight measurements with model predictions
+fig5 <- ggplot(data=b, aes(x=x, y=predicted, color=group)) + 
+  geom_line(linewidth=0.75, aes(lty=facet)) + 
+  geom_ribbon(data=subset(b, facet=="3%"), aes(ymin=conf.low, ymax=conf.high, fill=group), alpha=0.15,linetype=0) + 
+  geom_ribbon(data=subset(b, facet=="30%"), aes(ymin=conf.low, ymax=conf.high, fill=group), alpha=0.15,linetype=0) + 
+  geom_point(data=dat, aes(x=Week, y=Weight, color=Cavity_treatment, shape=Inoc_treatment), position = position_jitter(width = .15), size=2.5, alpha = 0.7) +
+  scale_color_manual(values=cbPalette) + 
+  scale_fill_manual(values=cbPalette) + 
+  scale_shape_manual(values = c(1,16)) +
+  scale_linetype_manual(values = c(2,1)) +
+  ylab("Colony weight (g)") + xlab("Week") + 
+  labs(tag = "A", color = "Cavity treatment", fill = "Cavity treatment", pch = "Initial \ninoculation rate", 
+       lty = "Initial \ninoculation rate") +
+  cowplot::theme_cowplot() + 
+  theme(legend.position=c(.04,.8), 
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=8))
+
+
+########################
+# Final colony reproduction figures
+
+dat1 <- read.csv("Outhouse_Colonies.csv") 
+dat1$Trt <- paste(dat1$Inoc_treatment, dat1$Cavity_treatment)
+
+dat1$Total_individuals_n <- dat1$Final_gynes_n + dat1$Final_males_n + dat1$Final_pupae_n + dat1$Final_workers_n
+dat1$Reps_n <- dat1$Final_gynes_n + dat1$Final_males_n 
+
+ccPalette <- c("#DF8F44FF", "#3399FF")
+
+
+all <- ggplot(data = dat1, aes(x=Cavity_treatment, y=Total_individuals_n, color = Cavity_treatment)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.1), size=1.25, alpha=0.75) + labs(tag="B") + ylim(-1,600) + ylab("No. individuals") +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none", axis.title.x=element_blank()) 
+
+reps <- ggplot(data = dat1, aes(x=Cavity_treatment, y=Reps_n, color = Cavity_treatment)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.1), size=1.25, alpha=0.75) + labs(tag="C") + ylim(-1,600) + ylab("No. reproductives") +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none", axis.title.x=element_blank()) 
+
+
+males <- ggplot(data = dat1, aes(x=Cavity_treatment, y=Final_males_n, color=Cavity_treatment)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.1), size=1.25, alpha=0.75) + labs(tag="D") +
+  ylab("No. males") + ylim(-1,400) +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none", axis.title.x=element_blank()) 
+
+workers <- ggplot(data = dat1, aes(x=Cavity_treatment, y=Final_workers_n, color=Cavity_treatment)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.1), size=1.25, alpha=0.75) + labs(tag="E") +
+  ylab("No. workers") + ylim(-1,400) +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none",
+        axis.title.x=element_blank()) 
+
+pupae <- ggplot(data = dat1, aes(x=Cavity_treatment, y=Final_pupae_n, color=Cavity_treatment)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.1), size=1.25, alpha=0.75) + labs(tag="F") +
+  ylab("No. pupae") + ylim(-1,400) +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none",
+        axis.title.x=element_blank()) 
+
+gynes <- ggplot(data = dat1, aes(x=Cavity_treatment, y=Final_gynes_n, color=Cavity_treatment)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.1), size=1.25, alpha=0.75) + labs(tag="G") +
+  ylab("No. gynes") + ylim(-1,400) +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none", axis.title.x=element_blank()) 
+
+# put the growth and reprodution figures together
+x <- ggarrange(all,reps,males,workers,pupae,gynes,nrow=3,ncol=2)
+y <- ggarrange(fig5, x, ncol=2)
+
+ggsave(y, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/Figure6.pdf", 
+       width=10.75, height=6.5)
+
+
+```
+
+#### Infection and Performance
+###### Crithidia
+```{r }
+#####################################################
+#### Crithidia and performance 
+#####################################################
+
+prev <- read.csv("Outhouse_weekly.csv")
+# turn characters into factors
+prev %>% mutate_if(is.character, as.factor) -> prev
+prev$Week.factor <- as.factor(prev$Week) 
+prev$Inoc_treatment <- as.factor(prev$Inoc_treatment)
+
+# add column for prevalence: binary for crithidia presence/absence
+prev <- prev %>% mutate(prevalence = ifelse(No_crithidia > 0,1,0))
+
+prev <- subset(prev, Week==6)
+prev6 <- prev %>% group_by(Colony,Inoc_treatment,Cavity_treatment) %>%
+  dplyr::summarise(prevalence = mean(prevalence))
+
+dat1 <- read.csv("Outhouse_Colonies.csv") 
+
+dat1$Total_individuals_n <- dat1$Final_gynes_n + dat1$Final_males_n + dat1$Final_pupae_n + dat1$Final_workers_n
+
+dat2 <- dat1 %>% left_join(prev6, join_by(Colony))
+
+#### Critihdia and performance statistics 
+
+# colony growth
+c <- lm((Final_box_weight-Weight) ~ prevalence, data = dat2)
+Anova(c)
+ggqqplot(residuals(c))                        # test normality of residuals
+plot(predict(c), residuals(c))                # test homogeneity of residuals (homoscedacity) 
+
+# individuals
+e <- lm((Final_gynes_n+Final_males_n+Final_workers_n + Final_pupae_n) ~ prevalence, data = dat2)
+Anova(e)
+ggqqplot(residuals(e))                        # test normality of residuals
+plot(predict(e), residuals(e))                # test homogeneity of residuals (homoscedacity) 
+
+# reproductives
+d <- lm((Final_gynes_n+Final_males_n) ~ prevalence, data = dat2)
+Anova(d)
+ggqqplot(residuals(d))                        # test normality of residuals
+plot(predict(d), residuals(d))                # test homogeneity of residuals (homoscedacity) 
+
+## for supplement
+workers <- lm(Final_workers_n ~ prevalence, data = dat2)
+Anova(workers)
+
+pupae <- lm(Final_pupae_n ~ prevalence, data = dat2)
+Anova(pupae)
+
+males <- lm(Final_males_n ~ prevalence, data = dat2)
+Anova(males)
+
+gynes <- lm(Final_gynes_n ~ prevalence, data = dat2)
+Anova(gynes)
+```
+
+##### Aspergillus
+```{r }
+#####################################################
+#### Aspergillus and performance 
+#####################################################
+
+dat <- read.csv("Aspergillus.csv")
+dat <- dat %>% 
+  filter(Inoc_treatment!="") %>%
+  filter(Colony_ID != "K") %>%            # omitting K, T because we didn't take data from them :(
+  filter(Colony_ID != "T")
+
+dat$total_individuals <- dat$Final_workers_n + dat$Final_gynes_n + dat$Final_males_n + dat$Final_pupae_n
+dat$total_individuals_larvae <- dat$Final_workers_n + dat$Final_gynes_n + dat$Final_males_n + dat$Final_pupae_n + dat$Final_larvae_n
+dat$percap_asp <- dat$Aspergillus / dat$total_individuals_larvae
+
+# filter out colonies without A. flavus infection; we only use colonies with infection in later analyses
+dat_inf <- filter(dat, Aspergillus > 0)
+
+# stats comparing aspergillus infection in control versus outhouse colonies: 
+# proportion test to compare proportion of colonies infected in each cavity treatment group
+# 4 infected control, 10 infected outhouse; 4 uninfected control, 0 uninfected outhouse; 2 missing data
+prop.test(x=c(4,10), n = c(8,10))
+
+# only infected colonies: of the infected colonies, aspergillus is greater in control colonies 
+t2 <- t.test(Aspergillus ~ Cavity_treatment, data = dat_inf, alternative = "greater")
+t2
+
+
+#### Aspergillus and colony growth statistics 
+
+# dat_inf - colonies with detected A. flavus infection > 0
+
+dat_inf$Change_weight <- dat_inf$Final_box_weight-dat_inf$Initial_weight
+
+m <- lm(Change_weight ~ percap_asp, data = dat_inf)
+Anova(m)
+ggqqplot(residuals(m))                        # test normality of residuals
+plot(predict(m), residuals(m))                # test homogeneity of residuals (homoscedacity) 
+
+
+m_ind <- lm(Final_males_n+Final_gynes_n+Final_workers_n+Final_pupae_n ~ percap_asp, data = dat_inf)
+
+Anova(m_ind) 
+ggqqplot(residuals(m_ind))                        # test normality of residuals
+plot(predict(m_ind), residuals(m_ind))                # test homogeneity of residuals (homoscedacity) 
+
+m_rep <- lm(Final_males_n+Final_gynes_n ~ percap_asp, data = dat_inf)
+
+Anova(m_rep)
+ggqqplot(residuals(m_rep))                        # test normality of residuals
+plot(predict(m_rep), residuals(m_rep))                # test homogeneity of residuals (homoscedacity)
+
+
+## for each individual measure of reproduction 
+workers <- lm(Final_workers_n ~ percap_asp, data = dat_inf)
+Anova(workers)
+
+pupae <- lm(Final_pupae_n ~ percap_asp, data = dat_inf)
+Anova(pupae)
+
+males <- lm(Final_males_n ~ percap_asp, data = dat_inf)
+Anova(males)
+
+gynes <- lm(Final_gynes_n ~ percap_asp, data = dat_inf)
+Anova(gynes)
+```
+
+###### Figure 7
+```{r }
+## FIGURE 7: INFECTION AND PERFORMANCE ###################
+
+### CRITHIDIA
+# colony growth
+p2 <- ggplot(dat2, aes(x=prevalence, y=Final_box_weight-Weight, color=Cavity_treatment.x)) + 
+  geom_point(alpha = 0.7, size = 2.25) +  
+  geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  scale_color_manual(values = ccPalette, name = "Cavity treatment") +
+  xlab("C. bombi prevalence") + ylab("Colony growth (g)") + labs(tag = "A") +
+  ylim(0,500) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none")
+
+# individuals
+p5 <- ggplot(dat2, aes(x=prevalence, y=(Final_males_n+Final_gynes_n+Final_workers_n+Final_pupae_n), color=Cavity_treatment.x)) + 
+  geom_point(alpha = 0.7, size = 2.25) +  
+  geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  scale_color_manual(values = ccPalette, name = "Cavity treatment") +
+  scale_y_continuous(limits = c(0,600), breaks=seq(0,600,100))+
+  xlab("C. bombi prevalence") + ylab("No. individuals") + labs(tag = "B") +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+# reproductives
+p3 <- ggplot(dat2, aes(x=prevalence, y=Final_males_n+Final_gynes_n, color=Cavity_treatment.x)) + 
+  geom_point(alpha = 0.7, size = 2.25) + geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  scale_color_manual(values = ccPalette, name = "Cavity treatment") +
+  xlab("C. bombi prevalence") + ylab("No. reproductives") + 
+  scale_y_continuous(limits = c(0,600), breaks=seq(0,600,100))+ labs(tag = "C") +
+  cowplot::theme_cowplot() +
+  theme(legend.position=c(0.5,0.85),
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=8))
+
+### ASPERGILLUS
+
+# colony growth
+growth_asp <- ggplot(filter(dat, percap_asp>0), aes(x=percap_asp, y=Final_box_weight-Initial_weight)) +  geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  geom_point(alpha = 0.7, size = 2.25, aes(color=Cavity_treatment)) + 
+  scale_color_manual(values = ccPalette) +
+  xlab("A. flavus prevalence") + ylab("Colony growth (g)") + labs(tag = "D") + ylim(0,500) +
+  scale_x_continuous(expand = c(-0.05,0), limits=c(0,.5)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,500)) +
+  coord_cartesian(xlim = c(-0.05,0.5), ylim = c(0,500)) +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+# all individuals
+all_asp <- ggplot(filter(dat, percap_asp>0), aes(x=percap_asp, y=(Final_males_n+Final_gynes_n+Final_workers_n+Final_pupae_n)), color=Cavity_treatment) + 
+  geom_point(aes(color=Cavity_treatment), alpha = 0.7, size = 2.25) + geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  xlab("A. flavus prevalence") + ylab("No. individuals") + labs(tag = "E") +
+  scale_x_continuous(expand = c(-0.05,0), limits=c(0,.5)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,600)) +
+  coord_cartesian(xlim = c(-0.05,0.5), ylim = c(-5,600)) +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+# reproductives
+rep_asp <- ggplot(filter(dat, percap_asp>0), aes(x=percap_asp, y=(Final_males_n+Final_gynes_n)), color=Cavity_treatment) + 
+  geom_point(aes(color=Cavity_treatment), alpha = 0.7, size = 2.25) + geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  xlab("A. flavus prevalence") + ylab("No. reproductives") + labs(tag = "F") +
+  scale_x_continuous(expand = c(-0.05,0), limits=c(0,.5)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,600)) +
+  coord_cartesian(xlim = c(-0.05,0.5), ylim = c(-5,600)) +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+figure7 <- ggarrange(p2,p5,p3,growth_asp,all_asp,rep_asp,nrow=2,ncol=3)
+
+ggsave(figure7, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/Figure7.pdf", 
+       width=10, height=6.5)
+
+```
+
+
+##### Figure S9
+```{r }
+#### SUPPLEMENTAL FIGURE ########################
+## individual reproduction measures; crithidia
+
+# workers
+workers_c <- ggplot(dat2, aes(x=prevalence, y=Final_workers_n, color=Cavity_treatment.x)) + 
+  geom_point(alpha = 0.7, size = 2.25) +  
+  geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  scale_color_manual(values = ccPalette, name = "Cavity treatment") +
+  scale_x_continuous(expand = c(-0.1,.1), limits=c(0,1)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,450)) +
+  coord_cartesian(xlim = c(-0.05,1), ylim = c(-5,450)) +
+#  scale_y_continuous(limits = c(0,450), breaks=seq(0,450,100))+
+  xlab("C. bombi prevalence") + ylab("No. workers") + labs(tag = "A") +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+pupae_c <- ggplot(dat2, aes(x=prevalence, y=Final_pupae_n, color=Cavity_treatment.x)) + 
+  geom_point(alpha = 0.7, size = 2.25) +  
+  geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  scale_color_manual(values = ccPalette, name = "Cavity treatment") +
+  scale_x_continuous(expand = c(-0.1,.1), limits=c(0,1)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,450)) +
+  coord_cartesian(xlim = c(-0.05,1), ylim = c(-5,450)) +
+ # scale_y_continuous(limits = c(0,450), breaks=seq(0,450,100))+
+  xlab("C. bombi prevalence") + ylab("No. pupae") + labs(tag = "B") +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+males_c <- ggplot(dat2, aes(x=prevalence, y=Final_males_n, color=Cavity_treatment.x)) + 
+  geom_point(alpha = 0.7, size = 2.25) +  
+  geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  scale_color_manual(values = ccPalette, name = "Cavity treatment") +
+  scale_x_continuous(expand = c(-0.1,.1), limits=c(0,1)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,450)) +
+  coord_cartesian(xlim = c(-0.05,1), ylim = c(-5,450)) +
+  #scale_y_continuous(limits = c(0,450), breaks=seq(0,450,100))+
+  xlab("C. bombi prevalence") + ylab("No. males") + labs(tag = "C") +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+gynes_c <- ggplot(dat2, aes(x=prevalence, y=Final_gynes_n, color=Cavity_treatment.x)) + 
+  geom_point(alpha = 0.7, size = 2.25) +  
+  geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  scale_color_manual(values = ccPalette, name = "Cavity treatment") +
+  scale_x_continuous(expand = c(-0.1,.1), limits=c(0,1)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,450)) +
+  coord_cartesian(xlim = c(-0.05,1), ylim = c(-5,450)) +
+ # scale_y_continuous(limits = c(0,450), breaks=seq(0,450,100))+
+  xlab("C. bombi prevalence") + ylab("No. gynes") + labs(tag = "D") +
+  cowplot::theme_cowplot() +
+  theme(legend.position=c(0.375,0.85),
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=10))
+
+## individual reproduction measures; aspergillus
+males_asp <- ggplot(filter(dat, percap_asp>0), aes(x=percap_asp, y=Final_males_n), color=Cavity_treatment) + 
+  geom_point(aes(color=Cavity_treatment), alpha = 0.7, size = 2.25) + geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  xlab("A. flavus prevalence") + ylab("No. males") + labs(tag = "G") +
+  scale_x_continuous(expand = c(-0.05,0), limits=c(0,.5)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,450)) +
+  coord_cartesian(xlim = c(-0.05,0.5), ylim = c(-5,450)) +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+workers_asp <- ggplot(filter(dat, percap_asp>0), aes(x=percap_asp, y=Final_workers_n), color=Cavity_treatment) + 
+  geom_point(aes(color=Cavity_treatment), alpha = 0.7, size = 2.25) + geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  xlab("A. flavus prevalence") + ylab("No. workers") + labs(tag = "E") +
+  scale_x_continuous(expand = c(-0.05,0), limits=c(0,.5)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,450)) +
+  coord_cartesian(xlim = c(-0.05,0.5), ylim = c(-5,450)) +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+pupae_asp <- ggplot(filter(dat, percap_asp>0), aes(x=percap_asp, y=Final_pupae_n), color=Cavity_treatment) + 
+  geom_point(aes(color=Cavity_treatment), alpha = 0.7, size = 2.25) + geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  xlab("A. flavus prevalence") + ylab("No. pupae") + labs(tag = "F") +
+  scale_x_continuous(expand = c(-0.05,0), limits=c(0,.5)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,450)) +
+  coord_cartesian(xlim = c(-0.05,0.5), ylim = c(-5,450)) +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+gynes_asp <- ggplot(filter(dat, percap_asp>0), aes(x=percap_asp, y=Final_gynes_n), color=Cavity_treatment) + 
+  geom_point(aes(color=Cavity_treatment), alpha = 0.7, size = 2.25) + geom_smooth(method = lm, color="#414141", linewidth = 0.6, alpha = 0.25, fullrange = TRUE) +
+  xlab("A. flavus prevalence") + ylab("No. gynes") + labs(tag = "H") +
+  scale_x_continuous(expand = c(-0.05,0), limits=c(0,.5)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,450)) +
+  coord_cartesian(xlim = c(-0.05,0.5), ylim = c(-5,450)) +
+  scale_color_manual(values = ccPalette) +
+  cowplot::theme_cowplot() +
+  theme(legend.position="none")
+
+figureS9 <- ggarrange(workers_c,pupae_c,males_c,gynes_c,workers_asp,pupae_asp,males_asp,gynes_asp,ncol=4,nrow=2)
+
+ggsave(figureS9, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/FigureS9.pdf", 
+       width=10.75, height=6.5)
+
+```
+
+#### Aspergillus and Crithidia
+```{r }
+#### Aspergillus and Crithidia relationship ##########################################
+
+## initialize data
+dat3 <- read.csv("Aspergillus.csv")
+dat1 <- read.csv("Outhouse_Colonies.csv") 
+prev <- read.csv("Outhouse_weekly.csv")
+
+# turn characters into factors 
+prev %>% mutate_if(is.character, as.factor) -> prev
+prev$Week.factor <- as.factor(prev$Week) 
+prev$Inoc_treatment <- as.factor(prev$Inoc_treatment)
+
+# add column for prevalence: binary for crithidia presence/absence
+prev <- prev %>% mutate(prevalence = ifelse(No_crithidia > 0,1,0))
+
+# just look at final week prevalences (week6) and group by colony
+prev <- subset(prev, Week==6)
+prev6 <- prev %>% group_by(Colony,Inoc_treatment,Cavity_treatment) %>%
+  dplyr::summarise(prevalence = mean(prevalence))
+
+## add total individuals category and join dataframes into one
+dat1$Total_individuals_n <- dat1$Final_gynes_n + dat1$Final_males_n + dat1$Final_pupae_n + dat1$Final_workers_n
+dat2 <- dat1 %>% left_join(prev6, join_by(Colony))
+
+## join aspergillus prevalence data to dat2
+dat2$Aspergillus <- dat3$Aspergillus
+dat2$asp.prev <- dat2$Aspergillus / (dat2$Final_workers_n + dat2$Final_gynes_n + dat2$Final_males_n + dat2$Final_pupae_n + dat2$Final_larvae_n)
+
+##      linear model to test whether there's a correlation between aspergillus prevalence (asp.prev) and crithidia prevalence (prevalence)
+##      for colonies with detected aspergillus infection only (asp.prev > 0)
+test <- lm(asp.prev ~ prevalence, data = filter(dat2, asp.prev >0))
+Anova(test)
+ggqqplot(residuals(test))                        # test normality of residuals
+plot(predict(test), residuals(test))                # test homogeneity of residuals (homoscedacity) 
+
+```
+
+###### Figure S8
+```{r}
+S8 <- ggplot(data = filter(dat2, asp.prev > 0), aes(x=prevalence, y=asp.prev, color=Cavity_treatment.x)) +
+  geom_point(size = 4, alpha = 0.6, position = position_jitter(width=0.005, height = 0.0005)) +
+  #geom_text(aes(label=Colony)) +
+  scale_color_manual(values=ccPalette, labels=c("Control", "Peripheral")) +
+  labs(col="Cavity treatment") +
+  xlab("C. bombi prevalence") + ylab("A. flavus prevalence") +
+  cowplot::theme_cowplot() +
+  theme(legend.position = c(0.6,0.8))
+
+ggsave(S8, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/S8.jpg", 
+       width=5, height=5)
+
+```
+
+#### Figure Temp and Humidity
+```{r Climate}
+
+dat <- read.csv("Climate.csv")
+dat$Colony <- as.factor(dat$Colony)
+
+p3 <- ggplot(dat, aes(x=Location, y=Temperature)) + 
+  geom_point(position = position_jitter(width = 0.1, height=0.1)) + ylab("Temperature (C)") + labs(tag = "(a)") +
+  cowplot::theme_cowplot()
+
+p4 <- ggplot(dat, aes(x=Location, y=Humidity)) + 
+  geom_point(position = position_jitter(width = 0.1, height=0.1)) + ylab("Relative humidity (%)") + ylim(50,100) +
+  labs(tag = "(b)") +
+  cowplot::theme_cowplot()
+
+p <- ggarrange(p3,p4,ncol=2,nrow=1)
+
+ggsave(p, file = "/Users/leah/Library/CloudStorage/OneDrive-CornellUniversity/Cornell/Outhouse_Project/FIGURES/S_TempHumidity.jpg", 
+       width=8, height=4.5)
+
+
+## Absolute humidity 
+install.packages("remotes")
+remotes::install_github("skgrange/threadr")
+library(threadr)
+
+dat$AH <- absolute_humidity(dat$Temperature, dat$Humidity)
+
+ggplot(dat, aes(x=Location, y=AH)) + 
+  geom_point() + ylab("Absolute Humidity (g/m^3)") + 
+  cowplot::theme_cowplot()
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
